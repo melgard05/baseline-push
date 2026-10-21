@@ -1,0 +1,19 @@
+# Cloudflare deploy settings for the baseline-push Worker.
+# Secrets (VAPID_PRIVATE, VAPID_PUBLIC, VAPID_SUBJECT, RESEND_KEY, ACCESS_KEY)
+# stay in Cloudflare and are never stored here.
+name = "baseline-push"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# keep plain-text variables set in the dashboard (ALLOW_ORIGIN, APP_URL, REPORT_FROM)
+keep_vars = true
+
+[[kv_namespaces]]
+binding = "BASELINE"
+id = "da5bae78b0714de4a354c3e9572dfc18"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
