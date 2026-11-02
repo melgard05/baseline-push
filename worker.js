@@ -428,6 +428,40 @@ async function handle(req, env) {
   }
 
   /* optional whole-dataset snapshot, last write wins */
+  /* Amber's weekly session notes, dropped off by the Wednesday import task.
+     POST needs AMBER_KEY (x-amber-key header) and can only add notes — it can't
+     read anything. GET needs the app's ACCESS_KEY, same as a backup. The app
+     reads the raw text, runs its own parser, and keeps what it hasn't seen. */
+  if (p === "/amber") {
+    if (req.method === "POST") {
+      const given = req.headers.get("x-amber-key") || "";
+      const want = env.AMBER_KEY || "";
+      let diff = given.length ^ want.length;
+      for (let i = 0; i < Math.min(given.length, want.length); i++) diff |= given.charCodeAt(i) ^ want.charCodeAt(i);
+      if (!want || diff !== 0) return json({ error: "amber key required or incorrect" }, env, 401);
+      const b = await req.json().catch(() => null);
+      const text = b && typeof b.text === "string" ? b.text : "";
+      const mid = b && typeof b.mid === "string" ? b.mid.slice(0, 80) : "";
+      if (!mid || text.length < 20 || text.length > 60000) return json({ error: "need mid and text" }, env, 400);
+      let box = null;
+      try { box = JSON.parse(await env.BASELINE.get("amber:inbox") || "null"); } catch (e) {}
+      if (!box || !Array.isArray(box.items)) box = { items: [] };
+      const dup = box.items.some(x => x.mid === mid);
+      if (!dup) {
+        box.items.push({ mid, at: new Date().toISOString(),
+          subject: typeof b.subject === "string" ? b.subject.slice(0, 200) : "",
+          sent: typeof b.sent === "string" ? b.sent.slice(0, 40) : "", text });
+        box.items = box.items.slice(-10);               // the last ten sessions is plenty
+        await env.BASELINE.put("amber:inbox", JSON.stringify(box));
+      }
+      return json({ ok: true, stored: !dup, held: box.items.length }, env);
+    }
+    if (!keyOk(req, url, env, null)) return json({ error: "access key required or incorrect" }, env, 401);
+    let box = null;
+    try { box = JSON.parse(await env.BASELINE.get("amber:inbox") || "null"); } catch (e) {}
+    return json({ items: (box && box.items) || [] }, env);
+  }
+
   if (p === "/backup") {
     const uid = url.searchParams.get("uid");
     if (!uid) return json({ error: "need uid" }, env, 400);

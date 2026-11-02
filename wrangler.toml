@@ -1,5 +1,5 @@
 # Cloudflare deploy settings for the baseline-push Worker.
-# Secrets (VAPID_PRIVATE, VAPID_PUBLIC, VAPID_SUBJECT, RESEND_KEY, ACCESS_KEY)
+# Secrets (VAPID_PRIVATE, VAPID_PUBLIC, VAPID_SUBJECT, RESEND_KEY, ACCESS_KEY, AMBER_KEY)
 # stay in Cloudflare and are never stored here.
 name = "baseline-push"
 main = "worker.js"
