@@ -13,7 +13,11 @@ binding = "BASELINE"
 id = "da5bae78b0714de4a354c3e9572dfc18"
 
 [triggers]
-crons = ["*/5 * * * *"]
+# Empty on purpose. The 5-minute schedule lives on the separate baseline-timer
+# worker, which calls /tick here: Cloudflare stopped running this worker's own
+# schedule in Oct 2026, and the free plan's 5 schedules are all in use, so
+# listing one here makes every build fail.
+crons = []
 
 [observability]
 enabled = true
