@@ -301,9 +301,25 @@ async function handle(req, env) {
       return json({ error: "access key required or incorrect" }, env, 401);
   }
 
-  if (p === "/" || p === "/health")
+  if (p === "/" || p === "/health") {
+    const beat = await readBeat(env);
     return json({ ok: true, service: "baseline-push", vapidPublic: env.VAPID_PUBLIC || null,
-      keyRequired: !!env.ACCESS_KEY }, env);
+      keyRequired: !!env.ACCESS_KEY,
+      lastTick: Math.max(beat.cron || 0, beat.http || 0) || null,   // any run, either timer
+      cronAt: beat.cron || null, pacedAt: beat.http || null, now: Date.now() }, env);
+  }
+
+  /* The backup timer. Cloudflare's own schedule has been known to stop without
+     a word, so something outside it (a scheduled GitHub workflow) calls this
+     every few minutes too. A run does nothing that a run a minute earlier
+     didn't already decide: reminders keep their own spacing, the weekly email
+     and digest their own once-a-day marks. Needs no key, says nothing back. */
+  if (p === "/tick") {
+    if (Date.now() - httpTickAt < 60000) return json({ ok: true, skipped: true }, env);
+    httpTickAt = Date.now();
+    await tick(env, "http");
+    return json({ ok: true }, env);
+  }
 
   if (p === "/vapid") return json({ publicKey: env.VAPID_PUBLIC || null }, env);
 
@@ -549,7 +565,27 @@ async function handle(req, env) {
 }
 
 /* ---------- cron ---------- */
-async function tick(env) {
+/* Heartbeat. Cloudflare stopped running this schedule for a weekend in October
+   2026 with no error anywhere; the only sign was reminders that never came.
+   Each run notes the time against whichever timer started it (written at most
+   every 15 minutes per timer, well inside the free 1,000 writes a day), /health
+   reports it, and the app shows a banner when nothing has run for a while. */
+const BEAT_EVERY = 15 * 60000;
+let httpTickAt = 0;
+async function readBeat(env) {
+  try { const b = JSON.parse(await env.BASELINE.get("beat") || "null"); if (b && typeof b === "object") return b; }
+  catch (e) {}
+  return {};
+}
+async function heartbeat(env, src) {
+  const b = await readBeat(env);
+  if (b[src] && Date.now() - b[src] < BEAT_EVERY) return false;
+  b[src] = Date.now();
+  await env.BASELINE.put("beat", JSON.stringify(b));
+  return true;
+}
+async function tick(env, src) {
+  try { await heartbeat(env, src || "cron"); } catch (e) {}
   const idx = await loadIdx(env);
   const report = [];
   for (const uid of idx.subs.slice()) {
@@ -663,11 +699,11 @@ async function tick(env) {
       report.push("email:" + acct + ":" + (r.ok ? "sent" : "failed(" + r.error + ")"));
     }
   } catch (e) { report.push("email:error(" + String(e && e.message || e) + ")"); }
-  console.log("baseline tick", report.join(" | ") || "nothing due");
+  console.log("baseline tick" + (src === "http" ? " (backup timer)" : ""), report.join(" | ") || "nothing due");
 }
 
 export default {
   fetch: (req, env) => handle(req, env).catch(e =>
     json({ error: String(e && e.message || e) }, env, 500)),
-  scheduled: (evt, env, ctx) => ctx.waitUntil(tick(env))
+  scheduled: (evt, env, ctx) => ctx.waitUntil(tick(env, "cron"))
 };
