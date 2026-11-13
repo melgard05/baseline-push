@@ -197,7 +197,7 @@ function keyOk(req, url, env, body) {
   return diff === 0;
 }
 const GUARDED = ["/backup", "/backupmeta", "/state", "/subscribe", "/unsubscribe",
-  "/snooze", "/test", "/devices", "/report", "/reportsend"];
+  "/snooze", "/test", "/devices", "/report", "/reportsend", "/suggest"];
 
 /* ---------- the weekly email ----------
    The app renders its Patterns page and hands it over after each save; this
@@ -532,6 +532,45 @@ async function handle(req, env) {
     await idxEdit(env, "reports", acct, true);
     return json({ ok: true, account: acct }, env);
   }
+  /* a suggestion typed into the app, emailed on so Claude can pick it up without
+     it being copied across by hand. Each one goes once: the app may retry, and
+     the same suggestion can arrive from both devices after a sync. */
+  if (p === "/suggest" && req.method === "POST") {
+    const b = await req.json().catch(() => null);
+    if (!b || !b.id || !b.text) return json({ error: "need id and text" }, env, 400);
+    const id = String(b.id).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40);
+    const text = String(b.text).slice(0, 4000);
+    if (!id) return json({ error: "bad id" }, env, 400);
+    const k = "sug:" + id;
+    if (await env.BASELINE.get(k)) return json({ ok: true, dup: true }, env);
+    const rec = b.uid ? JSON.parse(await env.BASELINE.get("sub:" + b.uid) || "null") : null;
+    const acct = b.account || acctOf(rec, b.uid);
+    const rep = JSON.parse(await env.BASELINE.get("report:" + acct) || "null");
+    if (!env.RESEND_KEY || !rep || !rep.to) return json({ ok: false, error: "no email address or Resend key yet" }, env, 503);
+    const build = String(b.build || "?").replace(/[^0-9a-z.?]/gi, "").slice(0, 10);
+    const when = b.at ? new Date(b.at) : new Date();
+    const first = text.replace(/\s+/g, " ").trim().slice(0, 70);
+    const escH = x => String(x).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    let res;
+    try {
+      res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + env.RESEND_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: env.REPORT_FROM || "Baseline <onboarding@resend.dev>", to: [rep.to],
+          subject: "Baseline request (b" + build + "): " + first,
+          text: text + "\n\n--\nSent from the Baseline suggestion box, " + when.toISOString() +
+            "\nBuild " + build + " · request id " + id,
+          html: '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:16px;line-height:1.5">' +
+            '<p style="white-space:pre-wrap">' + escH(text) + "</p>" +
+            '<p style="color:#7a8590;font-size:13px">Sent from the Baseline suggestion box, ' + escH(when.toISOString()) +
+            "<br>Build " + escH(build) + " · request id " + escH(id) + "</p></div>" })
+      });
+    } catch (e) { return json({ ok: false, error: "could not reach Resend" }, env, 502); }
+    if (!res.ok) return json({ ok: false, error: "Resend said " + res.status }, env, 502);
+    await env.BASELINE.put(k, JSON.stringify({ at: new Date().toISOString(), build }), { expirationTtl: 60 * 60 * 24 * 120 });
+    return json({ ok: true }, env);
+  }
+
   if (p === "/reportsend" && req.method === "POST") {
     const b = await req.json().catch(() => ({}));
     const rec = b.uid ? JSON.parse(await env.BASELINE.get("sub:" + b.uid) || "null") : null;
