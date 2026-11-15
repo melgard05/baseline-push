@@ -284,6 +284,62 @@ async function emailDue(uid, rec, env) {
   return res.ok ? "mail:sent(" + due.length + " due)" : "mail:failed(" + res.status + ")";
 }
 
+/* ---------- did the reminder arrive? ----------
+   The push service saying 201 only means it took the message. A phone that
+   Android has put to sleep can sit on it for hours, and nothing anywhere said
+   so. The service worker always asks /due when a push wakes it, which makes
+   that request a receipt: no receipt within MISS_AFTER, and it didn't arrive. */
+const MISS_AFTER = 10 * 60000;
+async function ackPush(env, uid) {
+  const pk = "push:" + uid;
+  const ps = JSON.parse(await env.BASELINE.get(pk) || "null");
+  if (!ps || !ps.want || ps.acked) return;
+  ps.acked = Date.now();
+  await env.BASELINE.put(pk, JSON.stringify(ps), { expirationTtl: 60 * 60 * 48 });
+  const late = Math.round((ps.acked - ps.lastSent) / 60000);
+  if (ps.missed) {
+    // it got there in the end: say how late, so the app can tell late from never
+    const list = JSON.parse(await env.BASELINE.get("miss:" + uid) || "[]");
+    const m = list.find(x => x.at === ps.lastSent);
+    if (m) { m.late = late; await env.BASELINE.put("miss:" + uid, JSON.stringify(list), { expirationTtl: 60 * 60 * 24 * 4 }); }
+  }
+  if (late >= 2) console.log("baseline receipt " + uid + ": reminder arrived " + late + " min after it was sent");
+}
+async function addMiss(env, uid, m) {
+  let list = [];
+  try { list = JSON.parse(await env.BASELINE.get("miss:" + uid) || "[]"); } catch (e) {}
+  list.push(m);
+  await env.BASELINE.put("miss:" + uid, JSON.stringify(list.slice(-20)), { expirationTtl: 60 * 60 * 24 * 4 });
+}
+async function emailMissed(uid, rec, ps, env) {
+  try {
+    if (!env.RESEND_KEY) return "";
+    const acct = acctOf(rec, uid);
+    const rep = JSON.parse(await env.BASELINE.get("report:" + acct) || "null");
+    if (!rep || !rep.to) return "";
+    const mk = "missmail:" + acct;
+    if (await env.BASELINE.get(mk) === ps.forKey) return "";          // one per check-in
+    await env.BASELINE.put(mk, ps.forKey, { expirationTtl: 60 * 60 * 36 });
+    const names = ps.names || [];
+    const what = names.length === 1 ? names[0] + " check-in" : names.length ? names.length + " check-ins (" + names.join(", ") + ")" : "A check-in";
+    const at = new Date(ps.lastSent).toLocaleTimeString("en-US", { timeZone: rec.tz || "UTC", hour: "numeric", minute: "2-digit" });
+    const app = env.APP_URL || "https://baseline-kelly.pages.dev/";
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + env.RESEND_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: env.REPORT_FROM || "Baseline <onboarding@resend.dev>", to: [rep.to],
+        subject: "Baseline reminder — " + what + " is open (your phone missed the " + at + " reminder)",
+        html: '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:17px;line-height:1.5;max-width:560px;margin:0 auto;padding:16px">' +
+          "<p><b>" + what + "</b> is open.</p>" +
+          '<p><a href="' + app + '" style="display:inline-block;background:#7fd4c1;color:#08110f;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:9px">Open Baseline</a></p>' +
+          "<p>The reminder went out at " + at + " and Google accepted it, but your phone didn’t pick it up within 10 minutes. " +
+          "That usually means Android has put Chrome or Baseline to sleep.</p>" +
+          '<p style="color:#7a8590;font-size:13px">Sent by your Baseline worker as a backup, at most once per check-in, only when the phone misses a reminder. Device: ' + uid + ".</p></div>" })
+    });
+    return res.ok ? "emailed" : "email-failed(" + res.status + ")";
+  } catch (e) { return "email-error"; }
+}
+
 /* ---------- HTTP ---------- */
 async function handle(req, env) {
   reqOrigin = req.headers.get("Origin") || "";
@@ -326,8 +382,11 @@ async function handle(req, env) {
   if (p === "/subscribe" && req.method === "POST") {
     const b = await req.json().catch(() => null);
     if (!b || !b.uid || !b.sub || !b.sub.endpoint) return json({ error: "need uid and sub" }, env, 400);
+    // the service worker's own re-subscribe doesn't say whether it's a phone; keep what the app said
+    const prevSub = b.mobile == null ? JSON.parse(await env.BASELINE.get("sub:" + b.uid) || "null") : null;
     await env.BASELINE.put("sub:" + b.uid, JSON.stringify({
       sub: b.sub,
+      mobile: b.mobile != null ? !!b.mobile : !!(prevSub && prevSub.mobile),
       account: (b.account || b.uid),
       tz: b.tz || "UTC",
       windows: Array.isArray(b.windows) ? b.windows : [],
@@ -417,6 +476,11 @@ async function handle(req, env) {
     }
     const { due, state, now } = await dueFor(uid, rec, env);
     await delIf(env, "clr:" + uid);                      // it has asked, so it knows
+    // The service worker only asks when a push has actually woken it (the app's
+    // own calls carry the account), so this is the receipt for the last reminder.
+    let missed;
+    if (!acctQ) await ackPush(env, uid);
+    else { try { missed = JSON.parse(await env.BASELINE.get("miss:" + uid) || "[]"); } catch (e) { missed = []; } }
     let isTest = false, isDigest = false;
     if (await env.BASELINE.get("test:" + uid)) { isTest = true; await env.BASELINE.delete("test:" + uid); }
     if (await env.BASELINE.get("digest:" + uid)) { isDigest = true; await env.BASELINE.delete("digest:" + uid); }
@@ -428,7 +492,8 @@ async function handle(req, env) {
       closed: (state.done || []).concat(state.skipped || []),
       done: state.done || [],
       skipped: state.skipped || [],
-      date: now.date
+      date: now.date,
+      missed: missed
     }, env);
   }
 
@@ -671,6 +736,15 @@ async function tick(env, src) {
 
     const pk = "push:" + uid;
     const pstate = JSON.parse(await env.BASELINE.get(pk) || "null") || { lastSent: 0, failures: 0, sent: 0, forKey: "" };
+    // A phone that never asked /due after a reminder the push service accepted
+    // didn't get it. Note it for the app, and email once per check-in.
+    if (rec.mobile && pstate.want && !pstate.acked && !pstate.missed && Date.now() - pstate.lastSent >= MISS_AFTER) {
+      pstate.missed = true;
+      await env.BASELINE.put(pk, JSON.stringify(pstate), { expirationTtl: 60 * 60 * 48 });
+      await addMiss(env, uid, { at: pstate.lastSent, due: pstate.names || due.map(w => w.label || w.id) });
+      const mailed = await emailMissed(uid, rec, pstate, env);
+      report.push(uid + ":missed" + (mailed ? "+" + mailed : ""));
+    }
     const gap = (rec.nagMins || 20) * 60000;
     if (Date.now() - pstate.lastSent < gap) { report.push(uid + ":waiting"); continue; }
     // Bounded, not endless: one reminder when a check-in opens, then at most
@@ -705,7 +779,9 @@ async function tick(env, src) {
       lastSent: Date.now(),
       failures: okSend ? 0 : (pstate.failures || 0) + 1,
       sent: (pstate.sent || 0) + (okSend ? 1 : 0),
-      forKey
+      forKey,
+      want: okSend,                                     // waiting for the device to ask /due
+      names: due.map(w => w.label || w.id)
     }), { expirationTtl: 60 * 60 * 48 });
     report.push(uid + ":" + status + "(" + due.length + " due)");
   }
